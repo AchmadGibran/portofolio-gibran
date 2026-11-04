@@ -22,7 +22,7 @@ const KF = [
   { c: [0, 1.25, 4.6], l: [0, 1.25, 0], x: 0, o: 0.3, mo: 0.18, orbit: 1.5, my: 0 },     // 04 stack: wide + benda orbit
   { c: [0, 1.3, 3.4], l: [0, 1.3, 0], x: 0.9, o: 0, mo: 0, orbit: 1, my: 0 },            // 05 projects: karakter menyingkir
   { c: [0, 1.3, 3.6], l: [0, 1.3, 0], x: -0.9, o: 0, mo: 0, orbit: 1, my: 0 },           // 06 highlights
-  { c: [-0.1, 1.55, 1.55], l: [0, 1.52, 0], x: 0, o: 0.85, mo: 0.28, orbit: 0.6, my: 0 }, // 07 contact: karakter di tengah, terlihat tembus kaca form
+  { c: [-0.1, 1.55, 1.55], l: [0, 1.52, 0], x: 0, o: 0.85, mo: 0.28, orbit: 0.85, my: 0 }, // 07 contact: karakter di tengah, terlihat tembus kaca form; orbit agak lebar supaya tidak menabrak tangan
 ];
 const ease = (t) => t * t * (3 - 2 * t);
 
@@ -100,6 +100,101 @@ function relaxArms(scene, name) {
   }
 }
 
+
+// ---------------------------------------------------------------------------------------------
+// Adegan Contact (desktop saja): kedua tangan karakter memegang sisi kiri & kanan kartu form, seolah menyodorkannya.
+// Posisi tangan dihitung tiap frame dari posisi kartu di layar (elemen [data-hold-card]) lalu lengan digerakkan
+// dengan IK dua-tulang. Kartu adalah HTML di depan canvas, jadi bagian tangan yang menimpa kartu tampak samar di balik kaca.
+// Bila pose terlihat janggal, cukup setel angka di HOLD (tidak perlu mengubah kode lain).
+const HOLD = {
+  from: 5.5,               // mulai terangkat saat posisi scroll melewati ini (satuan adegan; 6 = adegan Contact)
+  reach: 0.62,             // seberapa jauh tangan maju ke depan badan (proporsi panjang lengan; besar = lengan lebih lurus)
+  edge: 0.03,              // geser pergelangan ke luar tepi kartu (meter)
+  height: 0.7,             // posisi tangan di tinggi kartu (0 = atas, 1 = bawah)
+  pole: [0.5, -1, -0.3],   // arah siku menekuk: [keluar badan, bawah, depan]
+  along: [0.2, 0.8, 0.5], // arah telapak -> ujung jari: [ke dalam, atas, depan]
+  palm: [-1, 0, 0.1],      // arah jari melengkung (telapak menghadap ke tengah kartu)
+  curl: [0.5, 0.8, 0.6],   // lengkung tiap ruas jari (radian, sebelum dikali faktor tiap jari)
+};
+const FINGER_W = { Index: 0.7, Middle: 1, Ring: 1.1, Pinky: 1.25 };
+const _S = new THREE.Vector3(), _E = new THREE.Vector3(), _H = new THREE.Vector3(), _T = new THREE.Vector3(), _g = new THREE.Vector3();
+const _u = new THREE.Vector3(), _pv = new THREE.Vector3(), _el = new THREE.Vector3(), _w = new THREE.Vector3(), _f = new THREE.Vector3();
+const _n = new THREE.Vector3(), _p1 = new THREE.Vector3(), _p2 = new THREE.Vector3();
+
+function buildHold(scene) {
+  scene.updateMatrixWorld(true);
+  const sides = [], rest = [];
+  for (const side of ["Left", "Right"]) {
+    const get = (n) => scene.getObjectByName(side + n);
+    const arm = get("Arm"), fore = get("ForeArm"), hand = get("Hand"), mid = get("HandMiddle1");
+    if (!arm || !fore || !hand || !mid) continue;
+    arm.getWorldPosition(_a); fore.getWorldPosition(_b);
+    const sx = Math.sign(_b.x - _a.x) || (side === "Left" ? 1 : -1);
+    const fingers = [];
+    for (const f in FINGER_W) for (let k = 1; k <= 3; k++) {
+      const bone = get("Hand" + f + k), child = get("Hand" + f + (k + 1));
+      if (bone && child) fingers.push({ bone, child, w: FINGER_W[f], k, thumb: false });
+    }
+    for (let k = 1; k <= 3; k++) {
+      const bone = get("HandThumb" + k), child = get("HandThumb" + (k + 1));
+      if (bone && child) fingers.push({ bone, child, w: 1, k, thumb: true });
+    }
+    for (const b of [fore, hand, ...fingers.map((x) => x.bone)]) rest.push([b, b.quaternion.clone()]);
+    sides.push({ arm, fore, hand, mid, sx, fingers, along: vec(HOLD.along, sx), palm: vec(HOLD.palm, sx), pole: vec(HOLD.pole, sx) });
+  }
+  return sides.length ? { sides, rest, active: false } : null;
+}
+
+// arahkan tulang ke `target`, dicampur dengan arah saat ini sebesar h (0 = pose santai, 1 = pose memegang)
+function blendAim(bone, child, target, h) {
+  bone.getWorldPosition(_p1); child.getWorldPosition(_p2);
+  _p2.sub(_p1).normalize().lerp(target, h).normalize();
+  aimBone(bone, child, _p2);
+}
+
+function holdSide(s, camera, size, r, h, t, reduce) {
+  const { arm, fore, hand, sx } = s;
+  arm.getWorldPosition(_S); fore.getWorldPosition(_E); hand.getWorldPosition(_H);
+  const L1 = _S.distanceTo(_E), L2 = _E.distanceTo(_H);
+  // titik tepi kartu di layar -> titik di dunia 3D pada kedalaman tangan
+  const px = sx > 0 ? r.right : r.left;
+  const py = r.top + r.height * HOLD.height + (reduce ? 0 : Math.sin(t * 1.3 + sx) * 3);
+  _n.set((px / size.width) * 2 - 1, -((py / size.height) * 2 - 1), 0.5).unproject(camera).sub(camera.position).normalize();
+  _g.copy(camera.position).addScaledVector(_n, (_S.z + (L1 + L2) * HOLD.reach - camera.position.z) / _n.z);
+  _g.x += sx * HOLD.edge;
+  _g.addScaledVector(s.along, -0.12 * (L1 + L2)); // yang dipasang ke tepi kartu itu telapak, bukan pergelangan
+  // IK dua tulang: bahu -> siku -> pergelangan
+  _u.subVectors(_g, _S);
+  const d = Math.min((L1 + L2) * 0.98, Math.max(Math.abs(L1 - L2) + 0.03, _u.length()));
+  _u.normalize();
+  _T.copy(_S).addScaledVector(_u, d);
+  const a = (L1 * L1 - L2 * L2 + d * d) / (2 * d), hh = Math.sqrt(Math.max(0, L1 * L1 - a * a));
+  _pv.copy(s.pole); _pv.addScaledVector(_u, -_pv.dot(_u)).normalize();
+  _el.copy(_S).addScaledVector(_u, a).addScaledVector(_pv, hh);
+  blendAim(arm, fore, _w.subVectors(_el, _S).normalize(), h);
+  fore.getWorldPosition(_E);
+  blendAim(fore, hand, _w.subVectors(_T, _E).normalize(), h);
+  blendAim(hand, s.mid, s.along, h);
+  for (const c of s.fingers) {
+    if (c.thumb) { _f.copy(s.along).multiplyScalar(0.85).addScaledVector(s.palm, 0.3 + 0.1 * c.k); _f.z += 0.15; }
+    else { const ang = HOLD.curl[c.k - 1] * c.w; _f.copy(s.along).multiplyScalar(Math.cos(ang)).addScaledVector(s.palm, Math.sin(ang)); }
+    blendAim(c.bone, c.child, _f.normalize(), h);
+  }
+}
+
+// Dipanggil tiap frame selama adegan Contact. h = 0..1. Mengembalikan false bila sudah selesai kembali ke pose santai.
+function applyHold(rig, root, camera, size, h, t, reduce) {
+  const H = rig.hold;
+  for (const [b, q] of H.rest) b.quaternion.copy(q); // mulai dari pose santai agar campuran h konsisten
+  if (h <= 0.002) { H.active = false; return; }
+  const el = (H.el = H.el?.isConnected ? H.el : document.querySelector("[data-hold-card]"));
+  const r = el?.getBoundingClientRect();
+  if (!r || r.width < 10) { H.active = false; return; }
+  H.active = true;
+  root.updateMatrixWorld(true);
+  camera.updateMatrixWorld();
+  for (const s of H.sides) holdSide(s, camera, size, r, h, t, reduce);
+}
 
 // Benda-benda kecil dari bentuk dasar (ringan, tanpa aset tambahan). Hapus <Floaty> di bawah bila ada yang tak diinginkan.
 function Floaty({ children, position, speed, phase }) {
@@ -210,7 +305,7 @@ function Avatar({ reduce, mobile, shell }) {
     });
     const base = {};
     for (const k in bones) if (bones[k]) base[k] = bones[k].quaternion.clone();
-    return { scene, bones, base, morphs };
+    return { scene, bones, base, morphs, hold: buildHold(scene) };
   }, [gltf]);
 
   const invalidate = useThree((s) => s.invalidate);
@@ -225,7 +320,7 @@ function Avatar({ reduce, mobile, shell }) {
     const A = KF[i], B = KF[Math.min(last, i + 1)], f = ease(sp - i);
     const mx = (a, b) => a + (b - a) * f;
     const wide = Math.min(1, state.size.width / state.size.height / 1.5);
-    const c = (rig.c ||= { pos: new THREE.Vector3(0, 1.4, 3.1), look: new THREE.Vector3(0, 1.3, 0), x: 0, o: 0, orbit: 1, tp: new THREE.Vector3(), tl: new THREE.Vector3() });
+    const c = (rig.c ||= { pos: new THREE.Vector3(0, 1.4, 3.1), look: new THREE.Vector3(0, 1.3, 0), x: 0, o: 0, h: 0, orbit: 1, tp: new THREE.Vector3(), tl: new THREE.Vector3() });
     c.tp.set(mx(A.c[0], B.c[0]), mx(A.c[1], B.c[1]), mx(A.c[2], B.c[2]) + (mobile ? 0.5 : 0));
     c.tl.set(mx(A.l[0], B.l[0]), mx(A.l[1], B.l[1]) - (mobile ? mx(A.my, B.my) : 0), mx(A.l[2], B.l[2]));
     const kc = 1 - Math.exp(-dt * 4.5);
@@ -271,6 +366,10 @@ function Avatar({ reduce, mobile, shell }) {
       root.current.rotation.z = Math.sin(t * 0.5) * 0.012; // pindah tumpuan tipis
       orbit.current.rotation.y = t * 0.5;
     }
+    // tangan memegang kartu: hanya desktop, hanya mendekati adegan Contact
+    const hT = mobile || !rig.hold ? 0 : ease(Math.min(1, Math.max(0, (stage.p - HOLD.from) / (KF.length - 1 - HOLD.from))));
+    c.h += (hT - c.h) * kc;
+    if (rig.hold && (c.h > 0.002 || rig.hold.active)) applyHold(rig, root.current, camera, state.size, c.h, t, reduce);
     // Mode "demand": render berhenti total saat karakter tak terlihat (hemat baterai), bangun lagi saat scroll.
     if (oT > 0.02 || c.o > 0.02) invalidate();
   });
